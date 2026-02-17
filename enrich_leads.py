@@ -2,7 +2,7 @@
 """
 Enrichissement des leads — Ajout téléphone + email + dirigeant
 Sources :
-  1. Google Places API (téléphone, site web) — gratuit via $200 crédit/mois
+  1. Mappy/PagesJaunes API (téléphone, email, avis) — gratuit, sans inscription
   2. Annuaire Entreprises API (dirigeants) — gratuit, illimité
 """
 
@@ -10,67 +10,82 @@ import csv
 import requests
 import time
 import sys
-import json
 
 # ─── Configuration ───────────────────────────────────────────────────────────
-GOOGLE_API_KEY = ""  # <-- Colle ta clé Google Cloud ici
 INPUT_FILE = "leads.csv"
 OUTPUT_FILE = "leads_enriched.csv"
 
-# ─── Google Places API ───────────────────────────────────────────────────────
+MAPPY_API_KEY = "f2wjQp1eFdTe26YcAP3K92m7d9cV8x1Z"
+MAPPY_SEARCH_URL = "https://api-search.mappy.net/search/1.1/find"
 
-def google_find_phone(company_name, city, api_key):
-    """Cherche le téléphone d'une entreprise via Google Places API."""
+
+# ─── Source 1 : Mappy / Pages Jaunes (téléphone + email) ────────────────────
+
+def mappy_search(company_name, city):
+    """Cherche téléphone + email via l'API Mappy (données Pages Jaunes)."""
     query = f"{company_name} {city}"
 
-    # Étape 1 : Trouver le lieu
-    resp = requests.get(
-        "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
-        params={
-            "input": query,
-            "inputtype": "textquery",
-            "fields": "place_id,name,formatted_phone_number",
-            "language": "fr",
-            "key": api_key,
-        },
-        timeout=10,
-    )
+    try:
+        resp = requests.get(
+            MAPPY_SEARCH_URL,
+            params={
+                "q": query,
+                "max_results": 3,
+                "favorite_country": 250,
+                "language": "fr",
+            },
+            headers={
+                "apikey": MAPPY_API_KEY,
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+                "Origin": "https://fr.mappy.com",
+                "Referer": "https://fr.mappy.com/",
+            },
+            timeout=10,
+        )
 
-    if resp.status_code != 200:
+        if resp.status_code != 200:
+            return None, None
+
+        data = resp.json()
+        pois = data.get("pois", [])
+
+        if not pois:
+            return None, None
+
+        # Prendre le premier résultat
+        poi = pois[0]
+
+        # Vérifier que le résultat correspond bien (même ville)
+        poi_town = (poi.get("town") or "").lower()
+        if city.lower() not in poi_town and poi_town not in city.lower():
+            # Vérifier le code postal
+            poi_pcode = poi.get("pCode", "")
+            # On accepte quand même si le nom correspond bien
+            poi_name = (poi.get("name") or "").lower()
+            company_lower = company_name.lower()
+            # Au moins un mot significatif du nom doit matcher
+            words = [w for w in company_lower.split() if len(w) > 3]
+            if not any(w in poi_name for w in words):
+                return None, None
+
+        # Extraire téléphone et email
+        comm = poi.get("communication", {})
+        phone_data = comm.get("phone", {})
+        phone = phone_data.get("number")
+
+        # Vérifier "againstDirectMarketing" — respect RGPD
+        if phone_data.get("againstDirectMarketing"):
+            phone = None
+
+        email = comm.get("email") or poi.get("mail")
+
+        return phone, email
+
+    except (requests.exceptions.RequestException, ValueError):
         return None, None
 
-    data = resp.json()
-    candidates = data.get("candidates", [])
-    if not candidates:
-        return None, None
 
-    place_id = candidates[0].get("place_id")
-    if not place_id:
-        return None, None
-
-    # Étape 2 : Détails du lieu (téléphone + website)
-    resp2 = requests.get(
-        "https://maps.googleapis.com/maps/api/place/details/json",
-        params={
-            "place_id": place_id,
-            "fields": "formatted_phone_number,website,international_phone_number",
-            "language": "fr",
-            "key": api_key,
-        },
-        timeout=10,
-    )
-
-    if resp2.status_code != 200:
-        return None, None
-
-    result = resp2.json().get("result", {})
-    phone = result.get("formatted_phone_number") or result.get("international_phone_number")
-    website = result.get("website")
-
-    return phone, website
-
-
-# ─── Annuaire Entreprises API (gouv.fr) ─────────────────────────────────────
+# ─── Source 2 : Annuaire Entreprises API (dirigeants) ────────────────────────
 
 def get_dirigeant(siren):
     """Récupère le dirigeant principal via l'API Annuaire Entreprises."""
@@ -78,7 +93,7 @@ def get_dirigeant(siren):
 
     try:
         resp = requests.get(
-            f"https://recherche-entreprises.api.gouv.fr/search",
+            "https://recherche-entreprises.api.gouv.fr/search",
             params={"q": siren_9, "mtm_campaign": "lead-enrichment"},
             timeout=10,
         )
@@ -103,31 +118,13 @@ def get_dirigeant(siren):
 
         return None, None, None
 
-    except requests.exceptions.RequestException:
+    except (requests.exceptions.RequestException, ValueError):
         return None, None, None
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main():
-    # Vérifier la clé Google
-    if not GOOGLE_API_KEY:
-        print("=" * 60)
-        print("  ERREUR : Clé Google API manquante")
-        print("=" * 60)
-        print()
-        print("Ouvre enrich_leads.py et colle ta clé Google Cloud")
-        print("à la ligne : GOOGLE_API_KEY = \"\"")
-        print()
-        print("Pour obtenir une clé :")
-        print("  1. https://console.cloud.google.com")
-        print("  2. Crée un projet")
-        print("  3. Active 'Places API' (ancien) ou 'Places API (New)'")
-        print("  4. Identifiants > Créer > Clé API")
-        print()
-        print("C'est GRATUIT (200$/mois de crédit offert par Google)")
-        sys.exit(1)
-
     # Lire le CSV existant
     try:
         with open(INPUT_FILE, "r", encoding="utf-8-sig") as f:
@@ -137,40 +134,54 @@ def main():
         print(f"Fichier '{INPUT_FILE}' introuvable. Lance d'abord lead_generator.py")
         sys.exit(1)
 
+    if not leads:
+        print("Aucun lead dans le fichier.")
+        sys.exit(1)
+
     print("=" * 60)
     print("  ENRICHISSEMENT DES LEADS")
     print("=" * 60)
-    print(f"  Leads à enrichir : {len(leads)}")
-    print(f"  Sources : Google Places API + Annuaire Entreprises")
+    print(f"  Leads a enrichir : {len(leads)}")
+    print(f"  Sources :")
+    print(f"    1. Mappy / Pages Jaunes (telephone + email)")
+    print(f"    2. Annuaire Entreprises  (dirigeants)")
     print("=" * 60)
     print()
 
     enriched = []
-    stats = {"phone_found": 0, "dirigeant_found": 0, "total": len(leads)}
+    stats = {
+        "phone_found": 0,
+        "email_found": 0,
+        "dirigeant_found": 0,
+        "total": len(leads),
+    }
 
     for i, lead in enumerate(leads):
         company = lead.get("nom_societe", "")
         city = lead.get("ville", "")
         siret = lead.get("siret", "")
 
-        print(f"[{i+1}/{len(leads)}] {company[:40]}...", end=" ", flush=True)
+        print(f"[{i+1}/{len(leads)}] {company[:45]}", end=" ", flush=True)
 
-        # ─── Source 1 : Google Places (téléphone) ────────────────────────
+        # ─── Source 1 : Mappy (téléphone + email) ───────────────────────
         phone = lead.get("telephone", "")
-        website = ""
+        email = lead.get("email", "")
 
-        if not phone:
+        if not phone and company and city:
             try:
-                phone, website = google_find_phone(company, city, GOOGLE_API_KEY)
-                if phone:
+                m_phone, m_email = mappy_search(company, city)
+                if m_phone:
+                    phone = m_phone
                     stats["phone_found"] += 1
                     print(f"TEL:{phone}", end=" ", flush=True)
-                else:
-                    phone = ""
-                    print("pas de tel", end=" ", flush=True)
+                if m_email and not email:
+                    email = m_email
+                    stats["email_found"] += 1
+                    print(f"EMAIL:{email[:25]}", end=" ", flush=True)
+                if not m_phone and not m_email:
+                    print(".", end=" ", flush=True)
             except Exception as e:
-                print(f"err Google: {e}", end=" ", flush=True)
-                phone = ""
+                print(f"err:{e}", end=" ", flush=True)
 
         # ─── Source 2 : Annuaire Entreprises (dirigeant) ─────────────────
         prenom = lead.get("prenom", "")
@@ -187,19 +198,16 @@ def main():
             except Exception:
                 pass
 
-        # Si le site web a été trouvé via Google, on note mais on garde le lead
-        # (peut-être un simple Google My Business, pas un vrai site)
-
         lead["telephone"] = phone or ""
-        lead["email"] = lead.get("email", "")
+        lead["email"] = email or ""
         lead["prenom"] = prenom
         lead["nom"] = nom
 
         enriched.append(lead)
         print("OK")
 
-        # Pause pour respecter les limites API
-        time.sleep(0.2)
+        # Pause entre les requêtes
+        time.sleep(0.3)
 
     # ─── Export CSV enrichi ──────────────────────────────────────────────
     fieldnames = [
@@ -216,10 +224,13 @@ def main():
 
     print()
     print("=" * 60)
-    print(f"  RESULTATS")
+    print("  RESULTATS")
     print("=" * 60)
+    pct_phone = stats["phone_found"] * 100 // max(1, stats["total"])
+    pct_email = stats["email_found"] * 100 // max(1, stats["total"])
     print(f"  Total leads     : {stats['total']}")
-    print(f"  Telephones      : {stats['phone_found']} ({stats['phone_found']*100//max(1,stats['total'])}%)")
+    print(f"  Telephones      : {stats['phone_found']} ({pct_phone}%)")
+    print(f"  Emails          : {stats['email_found']} ({pct_email}%)")
     print(f"  Dirigeants      : {stats['dirigeant_found']} enrichis")
     print(f"  Fichier         : {OUTPUT_FILE}")
     print("=" * 60)
